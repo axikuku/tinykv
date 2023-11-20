@@ -1,2 +1,2 @@
-pub mod record;
-pub mod storage;
+pub(crate) mod record;
+pub(crate) mod storage;

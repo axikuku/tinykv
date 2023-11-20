@@ -1,44 +1,40 @@
+use std::{collections::HashMap, fs, path::Path, sync::Arc};
+
+use bytes::Bytes;
+use parking_lot::RwLock;
+
 use crate::{
     config::Config,
     data::{
-        record::{Record, RecordMeta, RecordType},
+        record::{Record, RecordPos, RecordType},
         storage::{storage_name_from_gen, Storage},
     },
-    index::{self, new_index, Index},
-    KvError, Result,
+    error::{KvError, Result},
+    index::{new_index, Index, IndexType},
 };
-use parking_lot::RwLock;
-use std::{collections::HashMap, fs, path::Path, sync::Arc};
 
 pub struct Engine {
     pub(crate) config: Config,
     pub(crate) active_storage: Arc<RwLock<Storage>>,
     pub(crate) older_storages: Arc<RwLock<HashMap<u32, Storage>>>,
-    pub(crate) index: Box<dyn index::Index>,
+    pub(crate) index: Box<dyn Index>,
 }
 
 impl Engine {
-    /// 用于构建`Engine`的默认配置
-    /// - path: $tmp
-    /// - storage size: 64MB
-    /// - index type: BTree
-    pub fn builder() -> Config {
-        Config::default()
-    }
-
-    pub(crate) fn open(config: Config) -> Result<Self> {
-        if !config.path.is_dir() {
-            std::fs::create_dir_all(&config.path)?;
+    /// 根据配置信息创建一个 Engine 实体
+    pub fn new(config: Config) -> Result<Self> {
+        if !config.dir_path.is_dir() {
+            std::fs::create_dir_all(&config.dir_path)?;
         }
         // 获取目标目录下storage的集合
-        let mut storages = load_storages_sorted(&config.path)?;
+        let mut storages = load_storages_sorted(&config.dir_path)?;
         let index = build_index_from_storage(&mut storages, config.index_type)?;
 
         // gen最大的文件即就是活跃文件
         // 若集合为空，则初始化新的storage作为活跃文件
         let active_storage = match storages.pop() {
             Some(s) => s,
-            None => Storage::new(&config.path, 0)?,
+            None => Storage::init_zero(&config.dir_path)?,
         };
 
         let older_storages = storages
@@ -54,6 +50,7 @@ impl Engine {
         })
     }
 
+    /// 存储 key，value 数据，其中 key 不为空
     pub fn set<B: Into<Vec<u8>>>(&self, key: B, value: B) -> Result<()> {
         let key = key.into();
         if key.is_empty() {
@@ -66,36 +63,27 @@ impl Engine {
         let pos = self.append_record(&record)?;
 
         // 更新索引
-        self.index.set(record.key, pos);
+        self.index.put(record.key, pos);
         Ok(())
     }
 
-    pub fn get<B: Into<Vec<u8>>>(&self, key: B) -> Result<Vec<u8>> {
+    /// 根据 key 获取对应的数据
+    pub fn get<B: Into<Vec<u8>>>(&self, key: B) -> Result<Bytes> {
         let key = key.into();
         if key.is_empty() {
             return Err(KvError::InvalidKey);
         }
 
-        let Some(meta) = self.index.get(&key) else {
+        let Some(pos) = self.index.get(&key) else {
             // key在索引中不存在
             return Err(KvError::InvalidKey);
         };
 
-        let active_storage = self.active_storage.read();
-        if active_storage.gen == meta.gen {
-            // 若key在活跃文件中
-            return Ok(active_storage.read_record(meta.offset)?.value);
-        }
-
-        // 若key在旧文件中
-        let older_storages = self.older_storages.read();
-        match older_storages.get(&meta.gen) {
-            Some(storage) => Ok(storage.read_record(meta.offset)?.value),
-            None => Err(KvError::InvalidKey),
-        }
+        self.read_value_from_pos(&pos)
     }
 
-    pub fn remove<B: Into<Vec<u8>>>(&mut self, key: B) -> Result<()> {
+    /// 根据 key 删除对应的数据
+    pub fn delete<B: Into<Vec<u8>>>(&self, key: B) -> Result<()> {
         let key = key.into();
         if key.is_empty() {
             return Err(KvError::InvalidKey);
@@ -112,11 +100,31 @@ impl Engine {
         self.append_record(&record)?;
 
         // 更新索引
-        self.index.remove(&record.key);
+        self.index.delete(&record.key);
         Ok(())
     }
 
-    fn append_record(&self, record: &Record) -> Result<RecordMeta> {
+    pub fn sync(&self) -> Result<()> {
+        self.active_storage.read().sync()
+    }
+
+    pub(crate) fn read_value_from_pos(&self, pos: &RecordPos) -> Result<Bytes> {
+        let active_storage = self.active_storage.read();
+        if active_storage.gen == pos.gen {
+            // 若key在活跃文件中
+            return Ok(active_storage.read_record(pos.offset)?.value.into());
+        }
+
+        // 若key在旧文件中
+        let older_storages = self.older_storages.read();
+        match older_storages.get(&pos.gen) {
+            Some(storage) => Ok(storage.read_record(pos.offset)?.value.into()),
+            None => Err(KvError::InvalidKey),
+        }
+    }
+
+    /// 追加写数据到活跃文件中
+    pub(crate) fn append_record(&self, record: &Record) -> Result<RecordPos> {
         let record_data = record.encode()?;
 
         let mut active_storage = self.active_storage.write();
@@ -129,11 +137,15 @@ impl Engine {
 
             let old_gen = active_storage.gen;
             // 初始化新的活跃文件
-            *active_storage = Storage::new(&self.config.path, old_gen + 1)?;
+            let file_name = self
+                .config
+                .dir_path
+                .join(storage_name_from_gen(old_gen + 1));
+            *active_storage = Storage::new(file_name.as_path())?;
 
             // 将旧的活跃文件放入map中
-            let old_gen_path = self.config.path.join(storage_name_from_gen(old_gen));
-            let older_storage = Storage::open(old_gen_path)?;
+            let old_gen_path = self.config.dir_path.join(storage_name_from_gen(old_gen));
+            let older_storage = Storage::new(old_gen_path.as_path())?;
 
             let mut older_storages = self.older_storages.write();
             older_storages.insert(older_storage.gen, older_storage);
@@ -141,7 +153,13 @@ impl Engine {
 
         // 写入记录
         active_storage.write(&record_data)?;
-        Ok(RecordMeta {
+
+        // 写时持久化
+        if self.config.sync_write {
+            active_storage.sync()?;
+        }
+
+        Ok(RecordPos {
             gen: active_storage.gen,
             offset,
         })
@@ -152,16 +170,16 @@ impl Drop for Engine {
     fn drop(&mut self) {
         match self.active_storage.write().sync() {
             Ok(_) => {}
-            Err(e) => eprint!("{}", e),
+            Err(e) => tracing::warn!("{}", e),
         }
     }
 }
 
 /// 从指定目录中读取已排序的`Storage`
-fn load_storages_sorted<P: AsRef<Path>>(dir_path: P) -> Result<Vec<Storage>> {
+fn load_storages_sorted(dir_path: &Path) -> Result<Vec<Storage>> {
     let mut storages = fs::read_dir(dir_path)?
         .flat_map(|entry| -> Result<_> { Ok(entry?.path()) })
-        .filter_map(|gen_path| Storage::open(gen_path).ok())
+        .filter_map(|gen_path| Storage::new(gen_path.as_path()).ok())
         .collect::<Vec<Storage>>();
     storages.sort_by_key(|s| s.gen);
     Ok(storages)
@@ -170,7 +188,7 @@ fn load_storages_sorted<P: AsRef<Path>>(dir_path: P) -> Result<Vec<Storage>> {
 /// 从`Storage`集合中构建索引
 fn build_index_from_storage(
     storages: &mut Vec<Storage>,
-    index_type: index::IndexType,
+    index_type: IndexType,
 ) -> Result<Box<dyn Index>> {
     let index = new_index(index_type);
     if storages.is_empty() {
@@ -193,15 +211,15 @@ fn build_index_from_storage(
 
             // 构建索引
             let key = storage.read_key_from_header(offset, &record)?;
-            let record_mate = RecordMeta {
+            let record_mate = RecordPos {
                 gen: storage.gen,
                 offset,
             };
 
             match record.record_type {
                 RecordType::UnexpectCommand => break,
-                RecordType::Set => index.set(key, record_mate),
-                RecordType::Remove => index.remove(key.as_slice()),
+                RecordType::Normal => index.put(key, record_mate),
+                RecordType::Remove => index.delete(key.as_slice()),
             };
             offset += record_size as u64;
         }

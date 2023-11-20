@@ -1,18 +1,19 @@
-use crate::Result;
 use bytes::BufMut;
 use prost::{encode_length_delimiter, length_delimiter_len};
+
+use crate::error::Result;
 
 #[derive(Clone, Copy)]
 pub enum RecordType {
     UnexpectCommand = 0,
-    Set = 1,
+    Normal = 1,
     Remove = 2,
 }
 
 impl From<u8> for RecordType {
     fn from(value: u8) -> Self {
         match value {
-            1 => Self::Set,
+            1 => Self::Normal,
             2 => Self::Remove,
             _ => Self::UnexpectCommand,
         }
@@ -20,7 +21,7 @@ impl From<u8> for RecordType {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct RecordMeta {
+pub(crate) struct RecordPos {
     pub(crate) gen: u32,
     pub(crate) offset: u64,
 }
@@ -36,7 +37,7 @@ impl Record {
         Self {
             key,
             value,
-            record_type: RecordType::Set,
+            record_type: RecordType::Normal,
         }
     }
 

@@ -1,40 +1,41 @@
 use std::{env::temp_dir, path::PathBuf};
 
-use crate::{engine::Engine, index::IndexType, Result};
+use crate::index::IndexType;
 
 pub struct Config {
-    pub(crate) path: PathBuf,
-    pub(crate) storage_size: u64,
-    pub(crate) index_type: IndexType,
+    pub dir_path: PathBuf,
+    pub storage_size: u64,
+    pub index_type: IndexType,
+    pub sync_write: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            path: temp_dir(),
+            dir_path: temp_dir(),
             storage_size: 1024 * 1024 * 64, // 64MB
-            index_type: IndexType::Btree,
+            index_type: IndexType::BTree,
+            sync_write: false,
         }
     }
 }
 
-impl Config {
-    pub fn set_path(mut self, path: PathBuf) -> Self {
-        self.path = path;
-        self
-    }
+#[derive(Default)]
+pub struct IteratorConfig {
+    pub prefix: Vec<u8>,
+    pub reverse: bool,
+}
 
-    pub fn set_storage_size(mut self, size: u64) -> Self {
-        self.storage_size = size;
-        self
-    }
+pub struct BatchConfig {
+    pub max_batch_num: usize,
+    pub sycn_write: bool,
+}
 
-    pub fn set_index_type(mut self, index_type: IndexType) -> Self {
-        self.index_type = index_type;
-        self
-    }
-
-    pub fn build(self) -> Result<Engine> {
-        Engine::open(self)
+impl Default for BatchConfig {
+    fn default() -> Self {
+        Self {
+            max_batch_num: 100,
+            sycn_write: true,
+        }
     }
 }

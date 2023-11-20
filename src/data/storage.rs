@@ -1,61 +1,45 @@
 use super::record::{ReadRecordHeaderBuf, Record, RecordType};
-use crate::{KvError, Result};
-use bytes::{Buf, BytesMut};
-use parking_lot::RwLock;
-use prost::decode_length_delimiter;
-use std::{
-    ffi::OsStr,
-    fs::{File, OpenOptions},
-    io::Write,
-    path::Path,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+use crate::{
+    error::{KvError, Result},
+    fio::{self, new_file_io},
 };
 
-#[cfg(target_os = "windows")]
-use std::os::windows::prelude::FileExt;
+use bytes::{Buf, BytesMut};
+use prost::decode_length_delimiter;
+
+use std::{
+    ffi::OsStr,
+    path::Path,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 const STORAGE_SUFFIX: &str = "storage";
 const STORAGE_SUFFIX_WITH_DOT: &str = ".storage";
 
 pub(crate) struct Storage {
     pub(crate) gen: u32,
-    offset: Arc<AtomicU64>,
-    fd: Arc<RwLock<File>>,
+    offset: AtomicU64,
+    fio: Box<dyn fio::FileIO>,
 }
 
 impl Storage {
-    // 打开一个已存在的`Storage`
-    pub(crate) fn open<P: AsRef<Path>>(gen_path: P) -> Result<Self> {
-        let gen = is_storage_file(gen_path.as_ref())?;
-        let fd = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .append(true)
-            .open(gen_path)?;
+    /// 打开或初始化一个`Storage`
+    pub(crate) fn new(gen_path: &Path) -> Result<Self> {
+        let gen = is_storage_file(gen_path)?;
+        let offset = AtomicU64::new(0);
+        let fio = Box::new(new_file_io(gen_path)?);
 
-        Ok(Self {
-            gen,
-            offset: Arc::new(AtomicU64::new(0)),
-            fd: Arc::new(RwLock::new(fd)),
-        })
+        Ok(Self { gen, offset, fio })
     }
 
-    /// 打开或初始化一个`Storgae`
-    pub(crate) fn new<P: AsRef<Path>>(dir_path: &P, gen: u32) -> Result<Self> {
-        let gen_path = dir_path.as_ref().join(storage_name_from_gen(gen));
-        let fd = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .append(true)
-            .open(gen_path)?;
+    /// 初始化一个`Storage`
+    pub(crate) fn init_zero(dir_path: &Path) -> Result<Self> {
+        let gen_path = dir_path.join(storage_name_from_gen(0));
+
         Ok(Self {
-            gen,
-            offset: Arc::new(AtomicU64::new(0)),
-            fd: Arc::new(RwLock::new(fd)),
+            gen: 0,
+            offset: AtomicU64::new(0),
+            fio: Box::new(new_file_io(gen_path.as_path())?),
         })
     }
 
@@ -66,9 +50,7 @@ impl Storage {
 
         // 计算剩余部分的偏移量并读取
         let mut kv_buf = BytesMut::zeroed(header_buf.key_size + header_buf.value_size + 4);
-        self.fd
-            .read()
-            .seek_read(&mut kv_buf, offset + header_len as u64)?;
+        self.fio.read(&mut kv_buf, offset + header_len as u64)?;
 
         let mut target_record = Record {
             key: kv_buf.get(..header_buf.key_size).unwrap().to_vec(),
@@ -103,9 +85,7 @@ impl Storage {
 
         // 计算并获取key
         let mut key_buf = BytesMut::zeroed(header_buf.key_size);
-        self.fd
-            .read()
-            .seek_read(&mut key_buf, offset + header_len as u64)?;
+        self.fio.read(&mut key_buf, offset + header_len as u64)?;
 
         Ok(key_buf.into())
     }
@@ -114,7 +94,7 @@ impl Storage {
     pub(crate) fn read_record_head_buf(&self, offset: u64) -> Result<ReadRecordHeaderBuf> {
         // record type + max key size + max value size
         let mut header_buf = BytesMut::zeroed(1 + 5 + 5);
-        self.fd.read().seek_read(&mut header_buf, offset)?;
+        self.fio.read(&mut header_buf, offset)?;
 
         // 获取Record类型
         let record_type = header_buf.get_u8().into();
@@ -139,7 +119,7 @@ impl Storage {
 
     /// 将buf写入至当前的`Storage`文件中
     pub(crate) fn write(&self, buf: &[u8]) -> Result<usize> {
-        let len = self.fd.write().write(buf)?;
+        let len = self.fio.write(buf)?;
 
         self.offset.fetch_add(len as u64, Ordering::SeqCst);
         Ok(len)
@@ -147,7 +127,7 @@ impl Storage {
 
     /// 将当前`Storage`的数据同步
     pub(crate) fn sync(&self) -> Result<()> {
-        self.fd.read().sync_all().map_err(KvError::Io)
+        self.fio.sync()
     }
 
     /// 获取当前`Storage`的数据偏移
@@ -162,15 +142,12 @@ impl Storage {
 }
 
 #[inline]
-fn is_storage_file<P: AsRef<Path>>(gen_path: P) -> Result<u32> {
-    if !gen_path.as_ref().is_file()
-        || gen_path.as_ref().extension() != Some(STORAGE_SUFFIX.as_ref())
-    {
+fn is_storage_file(gen_path: &Path) -> Result<u32> {
+    if !gen_path.is_file() || gen_path.extension() != Some(STORAGE_SUFFIX.as_ref()) {
         return Err(KvError::InvalidPath);
     }
 
     let Some(Ok(gen)) = gen_path
-        .as_ref()
         .file_name()
         .and_then(OsStr::to_str)
         .map(|s| s.trim_end_matches(STORAGE_SUFFIX_WITH_DOT))
